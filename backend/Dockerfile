@@ -31,81 +31,112 @@ FROM --platform=linux/arm64 debian:bookworm as debian-arm64
 RUN apt-get update
 RUN apt-get install -y libssh2-1-dev libssl-dev zlib1g-dev
 
-FROM --platform=$BUILDPLATFORM golang:1.20.5-bookworm as builder
+FROM --platform=$BUILDPLATFORM golang:1.20.14-bookworm as builder
 
 # docker build --build-arg GOPROXY=https://goproxy.io,direct -t mericodev/lake .
 ARG GOPROXY=
 # docker build --build-arg HTTPS_PROXY=http://localhost:4780 -t mericodev/lake .
 ARG HTTP_PROXY=
 ARG HTTPS_PROXY=
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
 
-RUN apt-get update
-RUN apt-get install -y gcc binutils libfindbin-libs-perl cmake libssh2-1-dev libssl-dev zlib1g-dev
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    gcc \
+    binutils \
+    libfindbin-libs-perl \
+    cmake \
+    libssh2-1-dev \
+    libssl-dev \
+    zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN if [ "$(arch)" != "aarch64" ] ; then \
-        apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu ; \
+# Install cross-compilation toolchains
+RUN if [ "$TARGETPLATFORM" != "$BUILDPLATFORM" ]; then \
+        if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+            apt-get update && \
+            apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu && \
+            rm -rf /var/lib/apt/lists/*; \
+        elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+            apt-get update && \
+            apt-get install -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu && \
+            rm -rf /var/lib/apt/lists/*; \
+        fi \
     fi
-RUN if [ "$(arch)" != "x86_64" ] ; then \
-        apt-get install -y gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu ; \
-    fi
 
-RUN go install github.com/vektra/mockery/v2@v2.20.0
-RUN go install github.com/swaggo/swag/cmd/swag@v1.16.1
+# Install Go tools
+RUN go install github.com/vektra/mockery/v2@v2.20.0 && \
+    go install github.com/swaggo/swag/cmd/swag@v1.16.1
 
 COPY --from=debian-amd64 /usr/include /rootfs-amd64/usr/include
 COPY --from=debian-amd64 /usr/lib/x86_64-linux-gnu /rootfs-amd64/usr/lib/x86_64-linux-gnu
 COPY --from=debian-amd64 /lib/x86_64-linux-gnu /rootfs-amd64/lib/x86_64-linux-gnu
+COPY --from=debian-amd64 /usr/lib/libz.so* /rootfs-amd64/usr/lib/
 
 COPY --from=debian-arm64 /usr/include /rootfs-arm64/usr/include
 COPY --from=debian-arm64 /usr/lib/aarch64-linux-gnu /rootfs-arm64/usr/lib/aarch64-linux-gnu
 COPY --from=debian-arm64 /lib/aarch64-linux-gnu /rootfs-arm64/lib/aarch64-linux-gnu
+COPY --from=debian-arm64 /usr/lib/libz.so* /rootfs-arm64/usr/lib/
 
+# Build libgit2 for target platform
+RUN mkdir -p /tmp/build && cd /tmp/build && \
+    wget https://github.com/libgit2/libgit2/archive/refs/tags/v1.3.2.tar.gz -O - | tar -xz && \
+    cd libgit2-1.3.2 && \
+    mkdir build && cd build && \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_SYSROOT=/rootfs-arm64 \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/deps \
+            -DOPENSSL_ROOT_DIR=/rootfs-arm64/usr \
+            -DOPENSSL_INCLUDE_DIR=/rootfs-arm64/usr/include \
+            -DUSE_BUNDLED_ZLIB=ON; \
+    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        cmake .. -DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_SYSROOT=/rootfs-amd64 \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/deps \
+            -DOPENSSL_ROOT_DIR=/rootfs-amd64/usr \
+            -DOPENSSL_INCLUDE_DIR=/rootfs-amd64/usr/include \
+            -DUSE_BUNDLED_ZLIB=ON; \
+    else \
+        cmake .. -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/deps \
+            -DUSE_BUNDLED_ZLIB=ON; \
+    fi && \
+    make -j install
 
-RUN for arch in aarch64 x86_64 ; do \
-        mkdir -p /tmp/build/${arch} && cd /tmp/build/${arch} && \
-        wget https://github.com/libgit2/libgit2/archive/refs/tags/v1.3.2.tar.gz -O - | tar -xz && \
-        cd libgit2-1.3.2 && \
-        mkdir build && cd build && \
-        if [ "$arch" = "aarch64" ] ; then \
-            cmake .. -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-                -DBUILD_SHARED_LIBS=ON -DCMAKE_SYSROOT=/rootfs-arm64 \
-                -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} ; \
-        elif [ "$arch" = "x86_64" ] ; then \
-            cmake .. -DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc \
-                -DBUILD_SHARED_LIBS=ON -DCMAKE_SYSROOT=/rootfs-amd64 \
-                -DCMAKE_INSTALL_PREFIX=/usr/local/deps/${arch} ; \
-        fi && \
-        make -j install ; \
-    done
-
-
-FROM builder as build
+FROM --platform=$BUILDPLATFORM builder as build
 
 WORKDIR /app
 COPY . /app
 ENV GOBIN=/app/bin
 
-ARG TARGETPLATFORM
 ARG TAG=
 ARG SHA=
 ARG GO_PLUGINS=
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ] ; then \
-        ln -s /usr/local/deps/aarch64 /usr/local/deps/target && \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
         export CC=aarch64-linux-gnu-gcc && \
-        export GOARCH=arm64 ; \
-    else \
-        ln -s /usr/local/deps/x86_64 /usr/local/deps/target && \
+        export GOARCH=arm64 && \
+        export CGO_LDFLAGS="-L/usr/local/deps/lib" && \
+        export CGO_CFLAGS="-I/usr/local/deps/include"; \
+    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
         export CC=x86_64-linux-gnu-gcc && \
-        export GOARCH=amd64 ; \
+        export GOARCH=amd64 && \
+        export CGO_LDFLAGS="-L/usr/local/deps/lib" && \
+        export CGO_CFLAGS="-I/usr/local/deps/include"; \
     fi && \
-    export PKG_CONFIG_PATH=/usr/local/deps/target/lib/pkgconfig && \
-    export CGO_ENABLED=1 &&\
+    export PKG_CONFIG_PATH=/usr/local/deps/lib/pkgconfig && \
+    export CGO_ENABLED=1 && \
+    export LD_LIBRARY_PATH=/usr/local/deps/lib && \
     DEVLAKE_PLUGINS="$GO_PLUGINS" make all
 
 # remove symlink in lib, we will recreate in final image
-RUN cd /usr/local/deps/target/lib && \
+RUN cd /usr/local/deps/lib && \
     for file in *.so* ; do \
         if [ -L $file ] ; then \
             unlink $file ; \
@@ -162,7 +193,7 @@ ARG DEBUG=
 # libraries
 ENV LD_LIBRARY_PATH=/app/libs
 RUN mkdir -p /app/libs
-COPY --from=build /usr/local/deps/target/lib/*.so* /app/libs
+COPY --from=build /usr/local/deps/lib/*.so* /app/libs
 COPY --from=build /go/bin /usr/bin
 RUN ldconfig -vn /app/libs
 
